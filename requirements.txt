@@ -1,0 +1,10 @@
+# The notebook runs on Kaggle's default image, which already provides all of these.
+# Listed for reproducing the environment elsewhere.
+numpy>=1.24
+scipy>=1.10
+torch>=2.0
+torchvision>=0.15
+transformers>=4.40      # RTDetrForObjectDetection
+pycocotools>=2.0.6
+pillow>=9.5
+matplotlib>=3.7
