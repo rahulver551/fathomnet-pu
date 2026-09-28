@@ -4,8 +4,6 @@ Verification suite for the FathomNet-CLEF 2026 PU pipeline ops.
 Expected values are hand-computed and hardcoded wherever possible (e.g. exp(-2)
 for a fully-overlapping Gaussian Soft-NMS decay) so the tests check the algorithm
 rather than merely re-deriving it from the implementation.
-
-Run:  python3 tests/test_pipeline.py
 """
 
 import math
@@ -705,6 +703,68 @@ obj = np.linspace(0, 1, 11)
 w = pu_background_weight(obj, w_min=0.25, w_max=1.0, tau=0.6, temperature=0.12)
 check("weight curve spans a useful range", (w.max() - w.min()) > 0.5, f"{w.min():.3f}..{w.max():.3f}")
 check("weight curve strictly decreasing", bool(np.all(np.diff(w) < 0)))
+
+# ======================================================================= #
+print("\n[11] generated modules match the notebook")
+# ======================================================================= #
+
+import dataclasses  # noqa: E402
+import json as _json  # noqa: E402
+import re as _re  # noqa: E402
+
+_root = Path(__file__).resolve().parents[1]
+_nb_path = _root / "notebooks" / "fathomnet_clef2026_pu_detection.ipynb"
+
+if not _nb_path.is_file():
+    check("notebook present", False, f"{_nb_path} missing")
+else:
+    _nb = _json.loads(_nb_path.read_text(encoding="utf-8"))
+    _cells = ["".join(c["source"]) for c in _nb["cells"] if c["cell_type"] == "code"]
+
+    import ast as _ast
+    _bad = []
+    for _i, _s in enumerate(_cells):
+        try:
+            _ast.parse(_s)
+        except SyntaxError as _e:
+            _bad.append(f"cell {_i}: {_e.msg}")
+    check("every notebook code cell parses", not _bad, str(_bad))
+
+    # The config dataclass is generated from the notebook's CFG; if they drift,
+    # the CLI runner silently ignores settings the notebook exposes.
+    _cfg_cells = [c for c in _cells if "class CFG:" in c]
+    check("exactly one CFG cell", len(_cfg_cells) == 1, f"{len(_cfg_cells)}")
+    if len(_cfg_cells) == 1:
+        _body = _cfg_cells[0].split("class CFG:", 1)[1].split("CFG = CFG()", 1)[0]
+        _nb_fields = _re.findall(r"^\s{4}(\w+)\s*:", _body, _re.M)
+        try:
+            from pu_config import PipelineConfig
+            _mod_fields = [f.name for f in dataclasses.fields(PipelineConfig)]
+            check("PipelineConfig matches notebook CFG",
+                  _mod_fields == _nb_fields,
+                  f"module {len(_mod_fields)} vs notebook {len(_nb_fields)}; "
+                  f"differ: {set(_mod_fields) ^ set(_nb_fields)}")
+        except ImportError as _e:
+            check("pu_config importable", False, str(_e))
+
+    # pu_pipeline must be importable without side effects: it is generated from
+    # notebook cells that also contain top-level calls, which must not survive.
+    _pipe = _root / "src" / "pu_pipeline.py"
+    if _pipe.is_file():
+        _tree = _ast.parse(_pipe.read_text(encoding="utf-8"))
+        _top = [type(n).__name__ for n in _tree.body
+                if not isinstance(n, (_ast.Expr, _ast.Import, _ast.ImportFrom,
+                                      _ast.FunctionDef, _ast.ClassDef, _ast.Assign))]
+        check("pu_pipeline has no top-level statements", not _top, str(_top))
+        _fns = {n.name for n in _tree.body if isinstance(n, _ast.FunctionDef)}
+        _need = {"probe_environment", "ensure_images", "build_dataset_classes",
+                 "build_category_maps", "build_model", "train_one_run",
+                 "predict_two_scale", "harvest_over_dataset", "evaluate_map",
+                 "load_checkpoint", "make_grad_scaler", "autocast_ctx"}
+        check("pu_pipeline exports the full runtime", _need <= _fns,
+              f"missing {_need - _fns}")
+    else:
+        check("pu_pipeline generated", False, f"{_pipe} missing")
 
 # ======================================================================= #
 print("\n" + "=" * 62)

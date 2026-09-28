@@ -1,14 +1,8 @@
-"""
-Core positive-unlabeled detection ops, NumPy reference implementation.
+"""Post-processing and data-hygiene ops for positive-unlabeled detection.
 
-These are the post-processing / data-hygiene algorithms of the pipeline. They are
-deliberately NumPy-only so they can be unit-tested on CPU without torch, and so
-the notebook's behaviour is reproducible and inspectable.
-
-Box convention throughout:
-  - "xywh" = COCO native: [x_min, y_min, width, height]
-  - "xyxy" = [x_min, y_min, x_max, y_max]
-Unless a function says otherwise it takes and returns xyxy float arrays of shape (N, 4).
+NumPy-only so they stay testable on CPU. Boxes are xyxy float arrays of shape
+(N, 4) unless a function says otherwise; "xywh" means COCO-native
+[x_min, y_min, width, height].
 """
 
 from __future__ import annotations

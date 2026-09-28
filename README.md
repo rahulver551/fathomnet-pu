@@ -42,26 +42,31 @@ the useful settings are strictly interior.
 ## Layout
 
 ```
-notebooks/fathomnet_clef2026_pu_detection.ipynb   self-contained Kaggle notebook
-src/pu_ops.py        Soft-NMS, IoU, two-scale merge, pseudo-label funnel (NumPy)
-src/pu_data.py       COCO audit/clean/split, pseudo-label merge, submission writer
-src/pu_criterion.py  PU-aware Hungarian detection loss (PyTorch)
-tests/test_pipeline.py  140 checks against hand-computed expected values
-build_notebook.py    assembles the notebook from src/, validating every cell
+kaggle_run.py            command-line entry point, one stage per invocation
+notebooks/…pu_detection.ipynb   self-contained notebook (inlines everything)
+src/pu_ops.py            Soft-NMS, IoU, two-scale merge, pseudo-label funnel
+src/pu_data.py           COCO audit/clean/split, pseudo-label merge, submission
+src/pu_criterion.py      PU-aware Hungarian detection loss (PyTorch)
+src/pu_pipeline.py       detector training, inference, harvesting  (generated)
+src/pu_config.py         pipeline configuration                    (generated)
+tests/test_pipeline.py   145 checks against hand-computed values
+build_notebook.py        assembles the notebook from src/
+build_pipeline_module.py extracts the generated modules from the notebook
 ```
 
-The notebook is **self-contained** — it inlines the modules, so it runs on Kaggle
-without this repo. `src/` is the canonical, tested copy; regenerate the notebook
-after editing it:
+Two files under `src/` are generated from the notebook and should not be edited
+by hand; the test suite asserts they have not drifted. After changing anything:
 
 ```bash
-python3 build_notebook.py
+python3 build_notebook.py         # rebuild and syntax-validate the notebook
+python3 build_pipeline_module.py  # regenerate pu_pipeline.py and pu_config.py
+python3 tests/test_pipeline.py    # 145 checks, including drift guards
 ```
 
 ## Running the tests
 
 ```bash
-python3 tests/test_pipeline.py     # 140 checks, NumPy only, no GPU
+python3 tests/test_pipeline.py     # 145 checks, NumPy only, no GPU
 ```
 
 Expected values are hardcoded where possible (e.g. `exp(-2)` for a
@@ -80,11 +85,28 @@ instances/image              1.00 -> 2.63 after recovery
 
 ## Running on Kaggle
 
-Set `CFG.stage` in the config cell and run top to bottom.
+```python
+!git clone -q https://github.com/rahulver551/fathomnet-pu.git /kaggle/working/repo
+%run /kaggle/working/repo/kaggle_run.py --stage verify
+```
 
-| `CFG.stage` | What it does | GPU | Rough time |
+Then, one stage per cell:
+
+```python
+%run /kaggle/working/repo/kaggle_run.py --stage audit
+%run /kaggle/working/repo/kaggle_run.py --stage train_base --max-images 300 --epochs 2
+%run /kaggle/working/repo/kaggle_run.py --stage harvest    --max-images 300
+%run /kaggle/working/repo/kaggle_run.py --stage train_pu   --max-images 300 --epochs 2
+%run /kaggle/working/repo/kaggle_run.py --stage infer      --max-images 300
+```
+
+`--max-images 0` uses the full dataset. `--dry-run` prints the resolved config
+without running anything. The notebook in `notebooks/` is an equivalent
+self-contained alternative driven by its `CFG.stage` field.
+
+| Stage | What it does | GPU | Rough time |
 |---|---|---|---|
-| `verify` | Built-in test suite only | no | seconds |
+| `verify` | Algorithm checks, no data needed | no | seconds |
 | `audit` | Stage 1: audit + clean + split | no | ~1 min |
 | `train_base` | Stage 2: baseline detector → checkpoint | yes | hours |
 | `harvest` | Stage 3: pseudo-labels from the baseline | yes | ~30 min |
@@ -97,11 +119,15 @@ and — unless an images dataset is attached — for the imagery itself.
 
 **Start with `verify`, then `audit`.** Both run on CPU in under a minute and will
 catch a wrong dataset path or a broken assumption before any GPU quota is spent.
-Each GPU stage checkpoints every epoch into `work_dir`, so a session that hits the
-wall can be resumed by changing `CFG.stage` in a fresh session.
+Each GPU stage checkpoints every epoch, so a session that hits the wall is resumed
+by running the next stage in a fresh session.
 
-`CFG.max_images` caps how many frames are used; leave it small for a first pass
-and set it to `0` for the full dataset.
+### Cost
+
+The competition download is 9.15 MB of annotations only. All 6,463 training frames
+and 1,425 test frames stream from FathomNet at runtime — roughly 19 GB and 4 GB of
+1920×1080 PNGs respectively. A full run is several GPU-hours across 2–3 sessions
+against Kaggle's 30 GPU-hours/week. Start with `--max-images 300`.
 
 ### Data
 
@@ -145,13 +171,13 @@ moved it.
 
 | Run | Change | Question |
 |---|---|---|
-| A | `pu_disabled=True`, no pseudo-labels | Baseline |
-| B | `pu_disabled=True` + pseudo-labels | Did Stage 3 alone help? |
-| C | `pu_disabled=False`, no pseudo-labels | Did the PU loss alone help? |
+| A | `--pu-disabled`, skip `harvest` | Baseline |
+| B | `--pu-disabled` + pseudo-labels | Did Stage 3 alone help? |
+| C | PU loss on, skip `harvest` | Did the PU loss alone help? |
 | D | Both | Do they compose, or overlap? |
 
-Then sweep `pu_w_min` over `{0.1, 0.25, 0.5, 0.75}`. Expect a precision–recall
-trade-off rather than a free win — and expect `pu_w_min=0` to fail loudly.
+Then sweep `--pu-w-min` over `{0.1, 0.25, 0.5, 0.75}`. Expect a precision–recall
+trade-off rather than a free win — and expect `--pu-w-min 0` to fail loudly.
 
 ## Scope
 
