@@ -113,10 +113,12 @@ warnings.filterwarnings("ignore", category=UserWarning)
 @dataclass
 class CFG:
     # ---- which stage to run -------------------------------------------------
-    # "verify" | "audit" | "all" | "train_base" | "harvest" | "train_pu" | "infer"
+    # "all" | "verify" | "audit" | "train_base" | "harvest" | "train_pu" | "infer"
     # "all" runs the whole pipeline in one session, which is the only way the
     # stages share /kaggle/working -- a fresh commit starts with an empty one.
-    stage: str = "verify"
+    # The verification section runs whatever the stage is and halts the notebook
+    # if anything fails, so this default cannot skip past a broken build.
+    stage: str = "all"
 
     # ---- paths --------------------------------------------------------------
     # Kaggle mounts competition data under /kaggle/input at an unpredictable
