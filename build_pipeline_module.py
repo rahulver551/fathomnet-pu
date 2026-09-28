@@ -26,6 +26,7 @@ PIPELINE_MARKERS = [
     "def predict_two_scale(",
     "def harvest_over_dataset(",
     "def evaluate_map(",
+    "def run_full_pipeline(",
 ]
 
 PIPELINE_HEADER = '''"""Detector training, inference and pseudo-label harvesting.

@@ -87,27 +87,44 @@ instances/image              1.00 -> 2.63 after recovery
 
 ```python
 !git clone -q https://github.com/rahulver551/fathomnet-pu.git /kaggle/working/repo
-%run /kaggle/working/repo/kaggle_run.py --stage verify
+%run /kaggle/working/repo/kaggle_run.py --stage verify   # seconds, CPU
+%run /kaggle/working/repo/kaggle_run.py --stage all      # the real run
 ```
 
-Then, one stage per cell:
+`--stage all` executes every stage in one session and ends by writing
+`submission.csv`. **Run it as one commit.** Kaggle's weekly GPU quota is generous
+but a single run is capped near nine hours, and every commit starts a fresh
+container — nothing written to `work_dir` by one version is visible to the next.
+Chaining the stages across commits means re-wiring each version's output back in
+as an input dataset; running them together avoids the problem outright.
 
-```python
-%run /kaggle/working/repo/kaggle_run.py --stage audit
-%run /kaggle/working/repo/kaggle_run.py --stage train_base --max-images 300 --epochs 2
-%run /kaggle/working/repo/kaggle_run.py --stage harvest    --max-images 300
-%run /kaggle/working/repo/kaggle_run.py --stage train_pu   --max-images 300 --epochs 2
-%run /kaggle/working/repo/kaggle_run.py --stage infer      --max-images 300
+The budget is wall-clock, not epoch-count:
+
+```
+--time-budget-hours 8.0    total; stay under Kaggle's ~9h session cap
+--reserve-hours     1.5    held back so inference always runs
 ```
 
-`--max-images 0` uses the full dataset. `--dry-run` prints the resolved config
-without running anything. The notebook in `notebooks/` is an equivalent
-self-contained alternative driven by its `CFG.stage` field.
+Training splits the remaining time across the baseline fit, the harvest and the
+PU retrain, and each stops cleanly at its deadline with a checkpoint saved. The
+reserve guarantees the run reaches inference and writes a submission on whatever
+checkpoint exists — a truncated model that submits beats a trained one killed
+before writing. Harvest and the PU retrain are individually fault-tolerant: if
+either fails the run falls back to the baseline checkpoint and still submits.
+
+Imagery is cached in `/kaggle/temp`, not `work_dir`, because Kaggle caps saved
+output at 20 GB and this dataset's frames are about that on their own.
+
+The individual stage names (`train_base`, `harvest`, `train_pu`, `infer`) remain
+for development and ablations. `--dry-run` prints the resolved config without
+running anything. The notebook in `notebooks/` is an equivalent self-contained
+alternative driven by its `CFG.stage` field.
 
 | Stage | What it does | GPU | Rough time |
 |---|---|---|---|
 | `verify` | Algorithm checks, no data needed | no | seconds |
 | `audit` | Stage 1: audit + clean + split | no | ~1 min |
+| `all` | Every stage, then `submission.csv` | yes | budgeted |
 | `train_base` | Stage 2: baseline detector → checkpoint | yes | hours |
 | `harvest` | Stage 3: pseudo-labels from the baseline | yes | ~30 min |
 | `train_pu` | Stages 3+4: retrain with pseudo-labels + PU loss | yes | hours |

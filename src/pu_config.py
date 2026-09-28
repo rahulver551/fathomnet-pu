@@ -10,7 +10,9 @@ from pathlib import Path
 @dataclass
 class PipelineConfig:
     # ---- which stage to run -------------------------------------------------
-    # "verify" | "audit" | "train_base" | "harvest" | "train_pu" | "infer"
+    # "verify" | "audit" | "all" | "train_base" | "harvest" | "train_pu" | "infer"
+    # "all" runs the whole pipeline in one session, which is the only way the
+    # stages share /kaggle/working -- a fresh commit starts with an empty one.
     stage: str = "verify"
 
     # ---- paths --------------------------------------------------------------
@@ -27,9 +29,10 @@ class PipelineConfig:
     split_group_key: str = ""  # e.g. "source" if images carry a provenance field
     drop_tiny_boxes: bool = False
 
-    # Cap the number of images actually used. Keep this small for a first
-    # end-to-end pass; set to 0 for the full set.
-    max_images: int = 200
+    # Cap the number of training images. 0 = the full set, which is what a real
+    # run wants: the wall-clock budget below, not this, is what keeps the run
+    # inside the session limit.
+    max_images: int = 0
     download_workers: int = 16
 
     # ---- model / training ---------------------------------------------------
@@ -37,7 +40,9 @@ class PipelineConfig:
     img_size: int = 800          # Stage 2: the high-resolution training path
     batch_size: int = 2
     grad_accum: int = 4
-    epochs: int = 2
+    #: An upper bound, not a target. The phase deadline usually stops training
+    #: first; this only sets the length of the LR schedule.
+    epochs: int = 6
     lr: float = 1e-4
     lr_backbone: float = 1e-5
     weight_decay: float = 1e-4
@@ -72,3 +77,13 @@ class PipelineConfig:
     softnms_iou_threshold: float = 0.30
     score_threshold: float = 0.01
     max_dets_per_image: int = 100
+
+    # ---- wall-clock budget (stage "all") -----------------------------------
+    #: Total budget. Kaggle kills a GPU session at ~9h, so stay under it.
+    time_budget_hours: float = 8.0
+    #: Held back from training so inference and the submission always happen.
+    #: A truncated model that submits beats a trained one killed before writing.
+    reserve_hours: float = 1.5
+    #: Test images to predict on. 0 = all of them, which is what a real
+    #: submission needs; only lower it for a smoke test.
+    test_max_images: int = 0

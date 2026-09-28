@@ -19,8 +19,8 @@ from pu_ops import *                          # noqa: E402,F401,F403
 from pu_data import *                         # noqa: E402,F401,F403
 from pu_pipeline import *                     # noqa: E402,F401,F403
 
-STAGES = ("verify", "audit", "train_base", "harvest", "train_pu", "infer")
-GPU_STAGES = {"train_base", "harvest", "train_pu", "infer"}
+STAGES = ("verify", "audit", "all", "train_base", "harvest", "train_pu", "infer")
+GPU_STAGES = {"all", "train_base", "harvest", "train_pu", "infer"}
 
 BASE_CKPT = "rtdetr_base.pt"
 PU_CKPT = "rtdetr_pu.pt"
@@ -54,6 +54,14 @@ def parse_args(argv=None):
     p.add_argument("--download-workers", type=int, default=d.download_workers)
     p.add_argument("--val-fraction", type=float, default=d.val_fraction)
 
+    b = p.add_argument_group("wall-clock budget (stage 'all')")
+    b.add_argument("--time-budget-hours", type=float, default=d.time_budget_hours,
+                   help="total budget; Kaggle kills a GPU session at ~9h")
+    b.add_argument("--reserve-hours", type=float, default=d.reserve_hours,
+                   help="held back so inference and the submission always run")
+    b.add_argument("--test-max-images", type=int, default=d.test_max_images,
+                   help="0 = all test images, which a real submission needs")
+
     g = p.add_argument_group("PU loss (stage 4)")
     g.add_argument("--pu-w-min", type=float, default=d.pu_w_min,
                    help="background weight for confident unmatched queries; must stay > 0")
@@ -85,6 +93,9 @@ def config_from_args(a) -> PipelineConfig:
     cfg.num_workers = a.num_workers
     cfg.download_workers = a.download_workers
     cfg.val_fraction = a.val_fraction
+    cfg.time_budget_hours = a.time_budget_hours
+    cfg.reserve_hours = a.reserve_hours
+    cfg.test_max_images = a.test_max_images
     cfg.pu_w_min = a.pu_w_min
     cfg.pu_w_max = a.pu_w_max
     cfg.pu_tau = a.pu_tau
@@ -232,15 +243,15 @@ def stage_audit(cfg):
     print("Next: --stage train_base (needs GPU + Internet)")
 
 
-def _prepare(ids, coco, cfg):
+def _prepare(ids, coco, cfg, deadline=None):
     """Resolve imagery for `ids`; return those actually available on disk."""
     sub = subset_coco(coco, ids)
     attached = find_attached_image_dir(
         cfg.input_roots, [im.get("file_name", "") for im in sub["images"][:20]])
-    cache = Path(attached) if attached else Path(cfg.work_dir) / "images"
-    if attached:
-        print(f"using attached image directory: {cache}")
-    ok, failed = ensure_images(sub, cache, workers=cfg.download_workers)
+    cache = Path(attached) if attached else image_cache_root(cfg)
+    print(f"image cache: {cache}" + ("  (attached dataset)" if attached else ""))
+    ok, failed = ensure_images(sub, cache, workers=cfg.download_workers,
+                               deadline=deadline)
     resolved = {im["id"]: im.get("_local_path") for im in sub["images"]}
     for im in coco["images"]:
         if im["id"] in resolved:
@@ -281,6 +292,12 @@ def stage_gpu(cfg, stage):
           + ("" if not cfg.max_images else f" (capped at {cfg.max_images})"))
 
     work = Path(cfg.work_dir)
+
+    if stage == "all":
+        summary = run_full_pipeline(
+            clean, test_json, use_tr, use_va, cfg, i2c, i2n, _prepare)
+        print("\n" + json.dumps(summary.get("submission") or {}, indent=2))
+        return
 
     if stage == "train_base":
         banner("STAGE 2  -- baseline detector (PU loss OFF)")

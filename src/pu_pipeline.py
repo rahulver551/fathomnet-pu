@@ -48,7 +48,7 @@ def probe_environment():
     return info
 
 
-GPU_STAGES = {"train_base", "harvest", "train_pu", "infer"}
+GPU_STAGES = {"all", "train_base", "harvest", "train_pu", "infer"}
 
 
 import urllib.request
@@ -98,12 +98,31 @@ def find_attached_image_dir(roots, probe_names, max_probe=40):
     return None
 
 
-def ensure_images(coco, cache_dir, workers=16, verbose=True):
+def image_cache_root(cfg):
+    """
+    Where downloaded frames live.
+
+    Deliberately NOT work_dir: Kaggle caps a notebook's saved output at 20 GB and
+    this dataset's imagery is roughly that on its own, so caching it in the output
+    directory makes the commit fail at save time. /kaggle/temp is scratch -- large,
+    and discarded with the session.
+    """
+    for scratch in ("/kaggle/temp", "/tmp"):
+        if Path(scratch).is_dir():
+            return Path(scratch) / "fathomnet_images"
+    return Path(cfg.work_dir) / "images"
+
+
+def ensure_images(coco, cache_dir, workers=16, verbose=True, deadline=None):
     """
     Make sure every image in `coco` exists on disk; download the missing ones.
 
     Returns (ok_image_ids, failed_image_ids). Images that cannot be fetched are
     reported rather than silently producing black frames.
+
+    `deadline` (an absolute time.time()) caps how long downloading may take:
+    FathomNet's throughput is not ours to control, and an unbounded fetch can eat
+    a whole session before training starts. Whatever arrived by then is used.
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -145,11 +164,32 @@ def ensure_images(coco, cache_dir, workers=16, verbose=True):
         return im_id, False
 
     if todo:
+        from concurrent.futures import as_completed
+
+        t_start = time.time()
+        seen_ids = set()
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            for i, (im_id, good) in enumerate(ex.map(fetch, todo), 1):
-                (ok if good else failed).append(im_id)
-                if verbose and i % 50 == 0:
-                    print(f"  {i}/{len(todo)}")
+            futures = [ex.submit(fetch, job) for job in todo]
+            try:
+                for n, fut in enumerate(as_completed(futures), 1):
+                    im_id, good = fut.result()
+                    seen_ids.add(im_id)
+                    (ok if good else failed).append(im_id)
+                    if verbose and n % 100 == 0:
+                        rate = n / max(time.time() - t_start, 1e-6)
+                        eta_min = (len(todo) - n) / max(rate, 1e-6) / 60.0
+                        print(f"  {n}/{len(todo)}  {rate:.1f} img/s  "
+                              f"eta {eta_min:.0f}m")
+                    if deadline is not None and time.time() > deadline:
+                        print(f"  >>> download budget spent after "
+                              f"{n}/{len(todo)}; using what arrived")
+                        break
+            finally:
+                for f in futures:
+                    f.cancel()
+        for im_id, _url, _path in todo:
+            if im_id not in seen_ids:
+                failed.append(im_id)
 
     if verbose:
         print(f"available: {len(ok)}   unavailable: {len(failed)}")
@@ -334,12 +374,16 @@ def load_checkpoint(path, map_location):
 
 
 def train_one_run(coco, train_ids, val_ids, cfg, criterion_config,
-                  ckpt_name, init_from=None):
+                  ckpt_name, init_from=None, deadline=None):
     """
-    Train the detector and checkpoint every epoch.
+    Train the detector, checkpointing every epoch.
 
     Checkpointing every epoch is not optional on Kaggle: a session that hits the
     wall mid-run otherwise loses the entire GPU allocation it consumed.
+
+    `deadline` is an absolute time.time() value. Training stops at the next step
+    boundary once it passes, saves, and returns -- so a long run degrades into a
+    shorter one instead of being killed with nothing on disk.
     """
     import torch
     from torch.utils.data import DataLoader
@@ -381,7 +425,13 @@ def train_one_run(coco, train_ids, val_ids, cfg, criterion_config,
         t0 = time.time()
         optimizer.zero_grad(set_to_none=True)
 
+        stopped_early = False
         for step, (pixel_values, targets) in enumerate(dl_tr):
+            if deadline is not None and time.time() > deadline:
+                print(f"  deadline reached at epoch {epoch} step {step}; "
+                      "stopping cleanly")
+                stopped_early = True
+                break
             pixel_values = pixel_values.to(device, non_blocking=True)
 
             with autocast_ctx(use_amp):
@@ -445,6 +495,9 @@ def train_one_run(coco, train_ids, val_ids, cfg, criterion_config,
             ckpt_path,
         )
         print(f"  checkpoint -> {ckpt_path}")
+
+        if stopped_early:
+            break
 
     return model, history, ckpt_path
 
@@ -692,3 +745,175 @@ def evaluate_map(coco_gt_dict, predictions, index_to_name=None, verbose=True):
             "precision got worse."
         )
     return stats
+
+
+def run_full_pipeline(coco_clean, test_json_path, train_ids, val_ids, cfg,
+                      index_to_cat_id, index_to_name, prepare_images):
+    """
+    Execute every stage in one session under a wall-clock budget.
+
+    `prepare_images(ids, coco, cfg)` resolves imagery and returns the ids that
+    are actually on disk. Returns a dict summarising what each phase produced.
+    """
+    import csv
+    import torch
+
+    t0 = time.time()
+    budget = float(cfg.time_budget_hours) * 3600.0
+    reserve = min(float(cfg.reserve_hours) * 3600.0, budget * 0.5)
+    train_budget = max(budget - reserve, 60.0)
+    work = Path(cfg.work_dir)
+    summary = {"phases": {}, "submission": None}
+
+    def left():
+        return budget - (time.time() - t0)
+
+    def mark(msg):
+        print(f"\n{'=' * 66}\n[{(time.time() - t0) / 3600:5.2f}h elapsed | "
+              f"{left() / 3600:5.2f}h left]  {msg}\n{'=' * 66}")
+
+    # Training time is split across the two fits and the harvest between them.
+    # The harvest is inference-only, so it gets the smallest share.
+    d_base = t0 + train_budget * 0.40
+    d_harvest = t0 + train_budget * 0.60
+    d_pu = t0 + train_budget
+
+    # ---- phase 1: imagery ------------------------------------------------
+    mark("PHASE 1/5  resolving training imagery")
+    # Cap the fetch at a quarter of the training budget: imagery that has not
+    # arrived by then costs more than it is worth.
+    d_download = time.time() + train_budget * 0.25
+    use_train = prepare_images(train_ids, coco_clean, cfg, deadline=d_download)
+    use_val = prepare_images(val_ids, coco_clean, cfg, deadline=d_download)
+    summary["phases"]["images"] = {"train": len(use_train), "val": len(use_val)}
+    print(f"train {len(use_train)} | val {len(use_val)}")
+    if not use_train:
+        raise SystemExit("no training imagery could be resolved")
+
+    # ---- phase 2: baseline ------------------------------------------------
+    mark("PHASE 2/5  baseline detector (PU loss OFF)")
+    cc_base = PULossConfig(
+        num_classes=cfg.num_classes, pu_disabled=True,
+        pseudo_label_weight=cfg.pseudo_label_weight,
+    )
+    model, hist, base_ckpt = train_one_run(
+        coco_clean, use_train, use_val, cfg, cc_base, "rtdetr_base.pt",
+        deadline=d_base,
+    )
+    summary["phases"]["train_base"] = {
+        "epochs": len(hist), "final_loss": hist[-1]["loss"] if hist else None,
+    }
+
+    # ---- phase 3: pseudo-label harvest ------------------------------------
+    coco_for_pu, added = coco_clean, 0
+    if left() > reserve:
+        mark("PHASE 3/5  conservative pseudo-label recovery")
+        try:
+            budget_ids = use_train
+            harvest, totals = harvest_over_dataset(
+                model, coco_clean, budget_ids, cfg, index_to_cat_id)
+            coco_for_pu, added = merge_pseudo_labels(coco_clean, harvest)
+            before = audit_coco(coco_clean)["instances_per_image"]["mean"]
+            after = audit_coco(coco_for_pu)["instances_per_image"]["mean"]
+            print(f"\nadded {added} pseudo-labels; "
+                  f"instances/image {before:.2f} -> {after:.2f}")
+            (work / "coco_with_pseudo.json").write_text(json.dumps(coco_for_pu))
+            summary["phases"]["harvest"] = {"added": added, "funnel": totals,
+                                            "instances_before": before,
+                                            "instances_after": after}
+        except Exception as e:
+            print(f">>> harvest failed ({type(e).__name__}: {e}); "
+                  "continuing with the cleaned data")
+            summary["phases"]["harvest"] = {"error": f"{type(e).__name__}: {e}"}
+    else:
+        print(">>> skipping harvest: not enough time left")
+        summary["phases"]["harvest"] = {"skipped": "out of time"}
+
+    # ---- phase 4: PU retrain ----------------------------------------------
+    final_ckpt = base_ckpt
+    if left() > reserve:
+        mark("PHASE 4/5  retrain with pseudo-labels + PU-aware background loss")
+        try:
+            cc_pu = PULossConfig(
+                num_classes=cfg.num_classes,
+                pu_w_min=cfg.pu_w_min, pu_w_max=cfg.pu_w_max,
+                pu_tau=cfg.pu_tau, pu_temperature=cfg.pu_temperature,
+                pu_disabled=cfg.pu_disabled,
+                pseudo_label_weight=cfg.pseudo_label_weight,
+            )
+            print(f"PU: w_min={cc_pu.pu_w_min} w_max={cc_pu.pu_w_max} "
+                  f"tau={cc_pu.pu_tau} T={cc_pu.pu_temperature}")
+            model, hist_pu, pu_ckpt = train_one_run(
+                coco_for_pu, use_train, use_val, cfg, cc_pu, "rtdetr_pu.pt",
+                init_from=base_ckpt, deadline=d_pu,
+            )
+            final_ckpt = pu_ckpt
+            summary["phases"]["train_pu"] = {
+                "epochs": len(hist_pu),
+                "final_loss": hist_pu[-1]["loss"] if hist_pu else None,
+                "pseudo_labels_used": added,
+            }
+        except Exception as e:
+            print(f">>> PU retrain failed ({type(e).__name__}: {e}); "
+                  "falling back to the baseline checkpoint")
+            summary["phases"]["train_pu"] = {"error": f"{type(e).__name__}: {e}"}
+    else:
+        print(">>> skipping PU retrain: not enough time left")
+        summary["phases"]["train_pu"] = {"skipped": "out of time"}
+
+    print(f"\nusing checkpoint: {final_ckpt}")
+
+    # ---- phase 5: inference + submission (always) -------------------------
+    mark("PHASE 5/5  two-scale inference + submission")
+    if test_json_path is None:
+        print(">>> no test annotations; cannot build a submission")
+        return summary
+
+    raw_test = load_coco(test_json_path)
+    test_ids = [im["id"] for im in raw_test["images"]]
+    if cfg.test_max_images:
+        test_ids = test_ids[: cfg.test_max_images]
+    print(f"test images declared: {len(test_ids)}")
+
+    # The submission needs these, so give the test fetch most of the reserve.
+    test_ids = prepare_images(test_ids, raw_test, cfg,
+                              deadline=time.time() + reserve * 0.5)
+    print(f"test images resolved: {len(test_ids)}")
+
+    preds = predict_two_scale(model, raw_test, test_ids, cfg, index_to_cat_id)
+    rows = build_submission(preds)
+
+    sub = work / "submission.csv"
+    with open(sub, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=SUBMISSION_COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+
+    n_declared = len(raw_test["images"])
+    covered = len(preds)
+    print(f"\nsubmission: {len(rows)} rows -> {sub}")
+    print(f"  images with >=1 detection: {covered}/{n_declared}")
+    if covered < n_declared:
+        print(f"  >>> {n_declared - covered} test images have no predictions "
+              "(undownloadable or no detection above threshold); they score as "
+              "missed")
+
+    summary["submission"] = {
+        "rows": len(rows), "images_covered": covered,
+        "images_declared": n_declared, "path": str(sub),
+        "checkpoint": str(final_ckpt),
+    }
+
+    # Validation diagnostics, only if there is time left over.
+    if left() > 300 and use_val:
+        try:
+            mark("optional  validation diagnostics")
+            vp = predict_two_scale(model, coco_clean, use_val, cfg, index_to_cat_id)
+            summary["val_stats"] = evaluate_map(
+                subset_coco(coco_clean, use_val), vp, index_to_name=index_to_name)
+        except Exception as e:
+            print(f"(validation diagnostics skipped: {type(e).__name__}: {e})")
+
+    (work / "run_summary.json").write_text(json.dumps(summary, indent=2, default=str))
+    mark(f"DONE in {(time.time() - t0) / 3600:.2f}h")
+    return summary
