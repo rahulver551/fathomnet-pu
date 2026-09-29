@@ -6,8 +6,10 @@ for a fully-overlapping Gaussian Soft-NMS decay) so the tests check the algorith
 rather than merely re-deriving it from the implementation.
 """
 
+import json as _json
 import math
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -765,6 +767,165 @@ else:
               f"missing {_need - _fns}")
     else:
         check("pu_pipeline generated", False, f"{_pipe} missing")
+
+# ======================================================================= #
+print("\n[12] image acquisition and geometry")
+# ======================================================================= #
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from pu_pipeline import image_urls, image_url, local_image_path, record_size, save_frame  # noqa: E402
+
+# --- every candidate URL must be offered, not just the first --------------
+rec = {"id": 1, "coco_url": "https://a.example/x.png",
+       "flickr_url": "https://b.example/x.png", "width": 1920, "height": 1080}
+check("image_urls returns every candidate",
+      image_urls(rec) == ["https://a.example/x.png", "https://b.example/x.png"],
+      str(image_urls(rec)))
+check("image_url keeps preference order", image_url(rec) == "https://a.example/x.png")
+check("image_urls dedupes identical urls",
+      len(image_urls({"coco_url": "https://a/x", "flickr_url": "https://a/x"})) == 1)
+check("image_urls ignores non-http values",
+      image_urls({"coco_url": "", "flickr_url": None, "url": 17}) == [])
+check("image_urls on a record with no urls", image_urls({"id": 5}) == [])
+
+# --- cached filenames are always .jpg -------------------------------------
+import tempfile as _tf  # noqa: E402
+_cache = Path(_tf.mkdtemp())
+check("cache path uses .jpg",
+      local_image_path({"id": 1, "file_name": "frame.png"}, _cache).suffix == ".jpg")
+check("cache path keeps the stem",
+      local_image_path({"id": 1, "file_name": "frame.png"}, _cache).stem == "frame")
+check("cache path falls back to a url hash",
+      local_image_path({"id": 1, "coco_url": "https://a/x.png"}, _cache).suffix == ".jpg")
+
+# --- record_size is authoritative over the decoded file -------------------
+from PIL import Image as _Im  # noqa: E402
+_small = _Im.new("RGB", (100, 50), (1, 2, 3))
+check("record_size prefers the record", record_size(rec, _small) == (1920, 1080),
+      str(record_size(rec, _small)))
+check("record_size falls back to the image",
+      record_size({"id": 2}, _small) == (100, 50))
+try:
+    record_size({"id": 3})
+    check("record_size raises without dimensions", False, "no raise")
+except ValueError:
+    check("record_size raises without dimensions", True)
+check("record_size rejects zero dimensions",
+      record_size({"id": 4, "width": 0, "height": 10}, _small) == (100, 50))
+
+# --- save_frame downscales, keeps aspect, and writes a real JPEG ----------
+import io as _io  # noqa: E402
+_buf = _io.BytesIO()
+_Im.new("RGB", (1920, 1080), (10, 120, 200)).save(_buf, format="PNG")
+_png = _buf.getvalue()
+
+_dst = _cache / "scaled.jpg"
+save_frame(_png, _dst, max_side=1024)
+_out = _Im.open(_dst)
+check("save_frame writes JPEG", _out.format == "JPEG", str(_out.format))
+check("save_frame honours max_side", max(_out.size) == 1024, str(_out.size))
+check("save_frame preserves aspect ratio",
+      abs(_out.size[0] / _out.size[1] - 1920 / 1080) < 0.01, str(_out.size))
+# The win is decode cost, which scales with pixel count, not with file size --
+# a flat test image compresses better as PNG than as JPEG and says nothing.
+check("save_frame cuts the pixels to decode",
+      (_out.size[0] * _out.size[1]) < 0.4 * (1920 * 1080),
+      f"{_out.size} vs (1920, 1080)")
+check("save_frame leaves no .part file", not (_cache / "scaled.jpg.part").exists())
+
+_dst2 = _cache / "unscaled.jpg"
+save_frame(_png, _dst2, max_side=0)
+check("max_side=0 leaves size alone", _Im.open(_dst2).size == (1920, 1080))
+
+_dst3 = _cache / "small.jpg"
+_b2 = _io.BytesIO(); _Im.new("RGB", (400, 300)).save(_b2, format="PNG")
+save_frame(_b2.getvalue(), _dst3, max_side=1024)
+check("save_frame never upscales", _Im.open(_dst3).size == (400, 300))
+
+# --- the geometry contract that downscaling depends on --------------------
+# A box normalised against the RECORD size must land back on the same pixels
+# after inference denormalises against that same record size, no matter what
+# resolution the cached file happens to be stored at.
+W, H = 1920, 1080
+bbox = [440.0, 384.0, 392.0, 157.0]           # real annotation from image_id 9
+cx, cy = (bbox[0] + bbox[2] / 2) / W, (bbox[1] + bbox[3] / 2) / H
+bw, bh = bbox[2] / W, bbox[3] / H
+back = [(cx - bw / 2) * W, (cy - bh / 2) * H, (cx + bw / 2) * W, (cy + bh / 2) * H]
+check("normalise/denormalise round-trips on record dims",
+      np.allclose(back, [bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]]),
+      str(back))
+
+# --- adaptive harvest ------------------------------------------------------
+rng_h = np.random.default_rng(7)
+junk = rng_h.uniform(0, 400, (500, 4))
+junk[:, 2:] = junk[:, :2] + 20
+strong = np.array([[100.0, 100.0, 160.0, 160.0]])
+v1 = {"boxes": np.vstack([junk, strong]),
+      "scores": np.concatenate([rng_h.uniform(0.01, 0.20, 500), [0.55]]),
+      "labels": np.ones(501, dtype=int)}
+v2 = {"boxes": np.array([[101.0, 99.0, 161.0, 159.0]]),
+      "scores": np.array([0.50]), "labels": np.array([1])}
+
+res_h = harvest_pseudo_labels([v1, v2], np.zeros((0, 4)), np.zeros(0),
+                              score_threshold=0.25, min_views=2, pre_top_k=30)
+c_h = res_h["counts"]
+check("top_k trims the candidate flood", c_h["after_top_k"] == 30, str(c_h))
+check("floor removes the noise", c_h["after_confidence"] == 1, str(c_h))
+check("the real detection survives", c_h["kept"] == 1, str(c_h))
+check("harvest recovers the right box",
+      np.allclose(res_h["boxes"][0], [100, 100, 160, 160]), str(res_h["boxes"]))
+check("harvest reports a score distribution",
+      set(res_h["stats"]) == {"max_score", "p99_score", "p50_score"},
+      str(res_h["stats"]))
+check("reported max score is correct", close(res_h["stats"]["max_score"], 0.55))
+check("funnel stays monotonic with top_k",
+      c_h["candidates"] >= c_h["after_top_k"] >= c_h["after_confidence"]
+      >= c_h["after_gt_dedup"] >= c_h["after_consistency"] >= c_h["kept"], str(c_h))
+
+# The failure mode from the first full run: a fixed high gate rejecting
+# everything. With the old 0.60 threshold this exact input yields nothing.
+res_old = harvest_pseudo_labels([v1, v2], np.zeros((0, 4)), np.zeros(0),
+                                score_threshold=0.60, min_views=2, pre_top_k=30)
+check("a too-high floor still no-ops (regression witness)",
+      res_old["counts"]["kept"] == 0, str(res_old["counts"]))
+check("and the adaptive floor does not",
+      res_h["counts"]["kept"] > res_old["counts"]["kept"])
+
+# --- the progress log ------------------------------------------------------
+from pu_pipeline import RunLog  # noqa: E402
+
+_logdir = Path(_tf.mkdtemp())
+_rl = RunLog(_logdir, t0=time.time() - 3600.0, budget_s=8 * 3600.0)
+_rl.event("run_start", budget_h=8)
+_rl.phase(2, "baseline")
+_rl.event("epoch", epoch=0, loss=3.1)
+_pj = _logdir / "progress.json"
+check("progress.json is written", _pj.is_file())
+_recs = _json.loads(_pj.read_text())
+check("every event is persisted", len(_recs) == 3, str(len(_recs)))
+check("events carry elapsed time", all("elapsed_h" in r for r in _recs))
+check("elapsed is computed from t0", 0.9 < _recs[0]["elapsed_h"] < 1.1,
+      str(_recs[0]["elapsed_h"]))
+check("remaining is computed from the budget",
+      6.9 < _recs[0]["remaining_h"] < 7.1, str(_recs[0]["remaining_h"]))
+check("phase events record their index",
+      _recs[1]["kind"] == "phase_start" and _recs[1]["phase"] == 2, str(_recs[1]))
+check("event fields are preserved", _recs[2]["loss"] == 3.1, str(_recs[2]))
+check("the log survives a killed run (readable mid-flight)",
+      _json.loads(_pj.read_text())[-1]["kind"] == "epoch")
+
+# Bookkeeping must never be able to take a run down.
+_broken = RunLog(Path("/nonexistent-dir-xyz"), t0=time.time())
+try:
+    _broken.event("noop")
+    check("an unwritable log does not raise", True)
+except Exception as e:
+    check("an unwritable log does not raise", False, f"{type(e).__name__}: {e}")
+
+check("pre_top_k=None keeps every candidate",
+      harvest_pseudo_labels([v1, v2], np.zeros((0, 4)), np.zeros(0),
+                            score_threshold=0.25, min_views=2,
+                            pre_top_k=None)["counts"]["after_top_k"] == 501)
 
 # ======================================================================= #
 print("\n" + "=" * 62)

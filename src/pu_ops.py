@@ -417,24 +417,37 @@ def harvest_pseudo_labels(
     view_dets: list[dict],
     gt_boxes: np.ndarray,
     gt_labels: np.ndarray,
-    score_threshold: float = 0.6,
+    score_threshold: float = 0.25,
     gt_iou_threshold: float = 0.5,
     consistency_iou: float = 0.6,
     min_views: int = 2,
     max_per_image: int | None = 5,
+    pre_top_k: int | None = 30,
 ) -> dict:
     """
-    The full Stage 3 funnel for one image, in the blog's order:
+    The full Stage 3 funnel for one image:
 
-        confidence filter -> IoU dedup against GT -> cross-view consistency -> cap
+        top-k -> confidence floor -> IoU dedup vs GT -> cross-view consistency -> cap
 
     A pseudo-label is only worth adding if it is more likely to *correct* missing
-    supervision than to *inject* a new error, so every stage here removes
-    candidates and none adds any. `max_per_image` is a blunt but effective guard
-    against one pathological frame dumping dozens of pseudo-labels into training.
+    supervision than to *inject* a new error, so every stage removes candidates
+    and none adds any.
 
-    Returns the surviving boxes/scores/labels plus a per-stage survivor count,
-    which is what you actually watch to tune the thresholds.
+    `pre_top_k` exists because a DETR-family head, flattened over queries and
+    classes at a low score floor, emits thousands of candidates per image -- the
+    overwhelming majority noise. Ranking and taking the strongest few is both
+    cheaper and more meaningful than testing them all against an absolute gate.
+
+    The absolute gate is deliberately a *floor*, not the primary filter. A fixed
+    high threshold has to be guessed against a score distribution you do not have
+    yet, and on an under-trained detector it rejects everything and the stage
+    silently becomes a no-op. Cross-view consistency is the real precision gate:
+    it asks whether a detection survives a transformation, which noise rarely
+    does and a genuine organism usually does.
+
+    Returns the surviving boxes/scores/labels, a per-stage survivor count, and
+    the observed score distribution -- so the thresholds can be set from evidence
+    on the next run instead of guessed again.
     """
     ref = view_dets[0]
     boxes = np.asarray(ref["boxes"], dtype=np.float64).reshape(-1, 4)
@@ -442,8 +455,19 @@ def harvest_pseudo_labels(
     labels = np.asarray(ref["labels"]).reshape(-1)
 
     counts = {"candidates": int(len(boxes))}
+    stats = {
+        "max_score": float(scores.max()) if len(scores) else 0.0,
+        "p99_score": float(np.percentile(scores, 99)) if len(scores) else 0.0,
+        "p50_score": float(np.percentile(scores, 50)) if len(scores) else 0.0,
+    }
 
-    # 1. confidence
+    # 0. rank and keep only the strongest candidates
+    if pre_top_k is not None and len(scores) > pre_top_k:
+        order = np.argsort(-scores)[:pre_top_k]
+        boxes, scores, labels = boxes[order], scores[order], labels[order]
+    counts["after_top_k"] = int(len(boxes))
+
+    # 1. absolute confidence floor
     keep = scores >= score_threshold
     boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
     counts["after_confidence"] = int(len(boxes))
@@ -476,4 +500,5 @@ def harvest_pseudo_labels(
         boxes, scores, labels = boxes[order], scores[order], labels[order]
     counts["kept"] = int(len(boxes))
 
-    return {"boxes": boxes, "scores": scores, "labels": labels, "counts": counts}
+    return {"boxes": boxes, "scores": scores, "labels": labels,
+            "counts": counts, "stats": stats}

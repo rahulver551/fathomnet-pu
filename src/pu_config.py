@@ -35,30 +35,51 @@ class PipelineConfig:
     # run wants: the wall-clock budget below, not this, is what keeps the run
     # inside the session limit.
     max_images: int = 0
-    download_workers: int = 16
+    download_workers: int = 24
+    #: Downscale frames to this longest side on download. The sources are
+    #: 1920x1080 PNGs; decoding those every epoch made training input-bound.
+    #: 0 keeps them untouched.
+    download_max_side: int = 1024
 
     # ---- model / training ---------------------------------------------------
     model_name: str = "PekingU/rtdetr_r50vd_coco_o365"
     img_size: int = 800          # Stage 2: the high-resolution training path
+    #: Kept at the profile already proven to fit a T4 at 800px. The throughput
+    #: problem was image decode, not GPU occupancy, so raising this trades a
+    #: real OOM risk over an unattended 8h run for an uncertain gain.
     batch_size: int = 2
     grad_accum: int = 4
-    #: An upper bound, not a target. The phase deadline usually stops training
-    #: first; this only sets the length of the LR schedule.
-    epochs: int = 6
+    #: A generous upper bound, not a target. The phase deadline ends training and
+    #: the LR schedule is anchored to that deadline, so this only needs to be
+    #: larger than the number of epochs that will actually fit.
+    epochs: int = 60
     lr: float = 1e-4
     lr_backbone: float = 1e-5
     weight_decay: float = 1e-4
     clip_grad: float = 0.1
-    num_workers: int = 2
+    num_workers: int = 4
+    #: Steps between training log lines. The first run emitted one every 50 and
+    #: Kaggle truncated the log view before the results at the end.
+    log_every: int = 200
     amp: bool = True
     seed: int = 1337
 
     # ---- Stage 3: pseudo-label recovery ------------------------------------
-    pseudo_score_threshold: float = 0.60
+    #: An absolute FLOOR, not the primary filter -- cross-view consistency is.
+    #: The previous 0.60 sat above the detector's whole score distribution and
+    #: let 15 of 15.9M candidates through, making the stage a no-op.
+    pseudo_score_threshold: float = 0.25
+    #: Rank candidates and keep only the strongest few per image before
+    #: filtering. A DETR head flattened over queries x classes emits thousands
+    #: per frame, nearly all noise.
+    pseudo_pre_top_k: int = 30
     pseudo_gt_iou_threshold: float = 0.50
     pseudo_consistency_iou: float = 0.60
     pseudo_min_views: int = 2
-    pseudo_max_per_image: int = 5
+    pseudo_max_per_image: int = 8
+    #: Images to harvest over. Three forward passes each, so the full training
+    #: set costs about an hour of GPU. 0 = all.
+    harvest_max_images: int = 1500
 
     # ---- Stage 4: PU-aware background loss ---------------------------------
     # The single most important setting in the notebook. pu_w_min must stay > 0:
@@ -67,6 +88,11 @@ class PipelineConfig:
     pu_w_min: float = 0.25
     pu_w_max: float = 1.00
     pu_tau: float = 0.50
+    #: Derive tau per batch as this quantile of unmatched-query objectness.
+    #: A fixed tau must be guessed against a score distribution you do not have
+    #: yet; at 0.50 the gate never opened and the PU term moved bg_w by ~1%.
+    #: 0 disables and falls back to the absolute pu_tau.
+    pu_tau_quantile: float = 0.98
     pu_temperature: float = 0.10
     pu_disabled: bool = False     # True = ordinary background loss (ablation)
     pseudo_label_weight: float = 0.50
@@ -74,6 +100,9 @@ class PipelineConfig:
     # ---- Stage 5: two-scale inference --------------------------------------
     infer_scales: tuple = (640, 960)
     infer_scale_weights: tuple = (1.0, 1.0)
+    #: Also run each scale horizontally flipped and merge. Costs one extra
+    #: forward pass per scale and reliably helps recall.
+    infer_flip_tta: bool = True
     softnms_method: str = "gaussian"
     softnms_sigma: float = 0.50
     softnms_iou_threshold: float = 0.30

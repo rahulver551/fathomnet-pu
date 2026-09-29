@@ -157,7 +157,15 @@ class PULossConfig:
     #: Background weight for an unmatched query with weak object evidence.
     pu_w_max: float = 1.0
     #: Objectness above which a query starts to look like a missing annotation.
+    #: Only used when pu_tau_quantile is 0.
     pu_tau: float = 0.5
+    #: Derive tau per batch as this quantile of the UNMATCHED queries' objectness
+    #: instead of fixing it absolutely. A fixed tau has to be guessed against a
+    #: score distribution you do not have yet: at 0.5 on an under-trained
+    #: detector the gate never opens and the PU term does nothing. A quantile
+    #: adapts as the model sharpens, always softening roughly the same top
+    #: fraction of suspicious queries. 0 disables and falls back to pu_tau.
+    pu_tau_quantile: float = 0.98
     #: Gate sharpness.
     pu_temperature: float = 0.1
     #: Set True to disable the PU behaviour entirely (ablation baseline).
@@ -311,7 +319,18 @@ class PUDetectionCriterion(nn.Module):
         # becoming more confident.
         with torch.no_grad():
             objectness = logits.sigmoid().max(dim=-1).values  # (B, Q)
-            bg_w = pu_background_weight(objectness, **cfg.background_kwargs())
+
+            kw = cfg.background_kwargs()
+            if cfg.pu_tau_quantile and not cfg.pu_disabled:
+                unmatched_obj = objectness[~matched_mask]
+                if unmatched_obj.numel() > 0:
+                    q = float(min(max(cfg.pu_tau_quantile, 0.0), 1.0))
+                    kw["tau"] = float(
+                        torch.quantile(unmatched_obj.float().flatten(), q)
+                    )
+            tau_used = kw["tau"]
+
+            bg_w = pu_background_weight(objectness, **kw)
             bg_w = torch.where(
                 matched_mask, torch.ones_like(bg_w), bg_w
             )                                                 # matched rows unaffected
@@ -353,4 +372,8 @@ class PUDetectionCriterion(nn.Module):
             "n_softened": (
                 (bg_w < cfg.pu_w_max - 1e-6) & (~matched_mask)
             ).sum().detach(),
+            # Logged so a gate that never opens is visible in the training log
+            # rather than inferred afterwards from a suspiciously flat bg_w.
+            "tau": torch.tensor(float(tau_used), device=device),
+            "max_objectness": objectness.max().detach(),
         }

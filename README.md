@@ -139,6 +139,24 @@ catch a wrong dataset path or a broken assumption before any GPU quota is spent.
 Each GPU stage checkpoints every epoch, so a session that hits the wall is resumed
 by running the next stage in a fresh session.
 
+### Monitoring a run
+
+Every phase, epoch and result is emitted as a single greppable line:
+
+```
+[PROGRESS] {"kind": "epoch", "elapsed_h": 1.4, "remaining_h": 6.6, "epoch": 3,
+            "loss": 2.71, "imgs_per_s": 14.2, "lr": 6.1e-05}
+```
+
+and the full history is rewritten to `work_dir/progress.json` after each event,
+so a run killed at the wall still leaves a readable account in the saved output.
+Kaggle publishes a version's log only when it terminates and truncates the log
+view, which is why per-step lines are throttled (`log_every`) and the things
+worth reading are few and structured.
+
+`imgs_per_s` on each epoch line is the number to watch: it is what says whether
+the input pipeline or the GPU is the constraint.
+
 ### Cost
 
 The competition download is 9.15 MB of annotations only. All 6,463 training frames
